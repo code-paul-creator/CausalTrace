@@ -1,5 +1,5 @@
 """
-CausalTrace Web UI — built with Streamlit.
+CausalTrace Web UI — built with Streamlit. 
 
 Run:
     streamlit run web/app.py
