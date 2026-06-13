@@ -1,6 +1,6 @@
 # CausalTrace
 Mechanistic Interpretability Toolkit for Transformer Language Models
-[README.md](https://github.com/user-attachments/files/28913481/README.md)# 🔬 CausalTrace
+[README.md] #🔬 CausalTrace
 
 **Mechanistic Interpretability Toolkit for Transformer Language Models**
 
