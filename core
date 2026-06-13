@@ -1,0 +1,410 @@
+"""
+ModelWrapper: Unified interface over HuggingFace transformer models
+with hooks for extracting residual stream, attention patterns, and MLP outputs.
+"""
+
+from __future__ import annotations
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+@dataclass
+class ActivationCache:
+    """Stores activations captured during a forward pass."""
+    residual_stream: Dict[str, torch.Tensor] = field(default_factory=dict)
+    attention_patterns: Dict[str, torch.Tensor] = field(default_factory=dict)
+    mlp_outputs: Dict[str, torch.Tensor] = field(default_factory=dict)
+    attn_outputs: Dict[str, torch.Tensor] = field(default_factory=dict)
+
+    def clear(self):
+        self.residual_stream.clear()
+        self.attention_patterns.clear()
+        self.mlp_outputs.clear()
+        self.attn_outputs.clear()
+
+
+class ModelWrapper:
+    """
+    Wraps a HuggingFace causal LM with hooks to capture internal activations.
+
+    Supports GPT-2, GPT-J, LLaMA, Mistral, and compatible architectures.
+
+    Example
+    -------
+    >>> model = ModelWrapper.from_pretrained("gpt2")
+    >>> with model.trace("The Eiffel Tower is located in"):
+    ...     logits, cache = model.run()
+    >>> cache.residual_stream["layer_6"].shape
+    torch.Size([1, 8, 768])
+    """
+
+    SUPPORTED_ARCH = {
+        "gpt2": ("transformer.h", "attn", "mlp"),
+        "gpt_neox": ("gpt_neox.layers", "attention", "mlp"),
+        "llama": ("model.layers", "self_attn", "mlp"),
+        "mistral": ("model.layers", "self_attn", "mlp"),
+    }
+
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer,
+        arch_key: str = "gpt2",
+        device: str = "cpu",
+    ):
+        self.model = model.to(device)
+        self.tokenizer = tokenizer
+        self.device = device
+        self.arch_key = arch_key
+        self.cache = ActivationCache()
+        self._hooks: List = []
+        self._prompt: Optional[str] = None
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name: str,
+        device: str = "cpu",
+        **kwargs,
+    ) -> "ModelWrapper":
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+        arch_key = cls._detect_arch(model)
+        return cls(model, tokenizer, arch_key=arch_key, device=device)
+
+    @staticmethod
+    def _detect_arch(model: nn.Module) -> str:
+        name = type(model).__name__.lower()
+        if "gpt2" in name:
+            return "gpt2"
+        if "neox" in name:
+            return "gpt_neox"
+        if "llama" in name:
+            return "llama"
+        if "mistral" in name:
+            return "mistral"
+        return "gpt2"  # fallback
+
+    def trace(self, prompt: str) -> "ModelWrapper":
+        """Context manager: set the prompt and register activation hooks."""
+        self._prompt = prompt
+        return self
+
+    def __enter__(self):
+        self._register_hooks()
+        return self
+
+    def __exit__(self, *_):
+        self._remove_hooks()
+
+    def _register_hooks(self):
+        """Register forward hooks on every transformer layer."""
+        layers_path, attn_name, mlp_name = self.SUPPORTED_ARCH[self.arch_key]
+
+        # Resolve layer list via dotted path
+        layers = self.model
+        for part in layers_path.split("."):
+            layers = getattr(layers, part)
+
+        for layer_idx, layer in enumerate(layers):
+            key = f"layer_{layer_idx}"
+
+            # Residual stream (input to each layer)
+            def make_residual_hook(k):
+                def hook(module, inp, out):
+                    self.cache.residual_stream[k] = inp[0].detach()
+                return hook
+
+            h = layer.register_forward_hook(make_residual_hook(key))
+            self._hooks.append(h)
+
+            # Attention pattern
+            attn_module = getattr(layer, attn_name, None)
+            if attn_module is not None:
+                def make_attn_hook(k):
+                    def hook(module, inp, out):
+                        # out is typically (attn_output, attn_weights, ...)
+                        if isinstance(out, tuple) and len(out) > 1 and out[1] is not None:
+                            self.cache.attention_patterns[k] = out[1].detach()
+                        self.cache.attn_outputs[k] = out[0].detach()
+                    return hook
+                h = attn_module.register_forward_hook(make_attn_hook(key))
+                self._hooks.append(h)
+
+            # MLP output
+            mlp_module = getattr(layer, mlp_name, None)
+            if mlp_module is not None:
+                def make_mlp_hook(k):
+                    def hook(module, inp, out):
+                        self.cache.mlp_outputs[k] = out.detach()
+                    return hook
+                h = mlp_module.register_forward_hook(make_mlp_hook(key))
+                self._hooks.append(h)
+
+    def _remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+    def run(self, prompt: Optional[str] = None) -> Tuple[torch.Tensor, ActivationCache]:
+        """
+        Run a forward pass and return (logits, cache).
+
+        Parameters
+        ----------
+        prompt : str, optional
+            If provided, overrides the prompt set in `trace()`.
+        """
+        self.cache.clear()
+        text = prompt or self._prompt
+        if text is None:
+            raise ValueError("Provide a prompt via trace() or run(prompt=...)")
+
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_attentions=True)
+
+        return outputs.logits, self.cache
+
+    def top_tokens(self, logits: torch.Tensor, k: int = 10) -> List[Tuple[str, float]]:
+        """Return top-k predicted tokens with probabilities for the last position."""
+        probs = torch.softmax(logits[0, -1, :], dim=-1)
+        top = torch.topk(probs, k)
+        return [
+            (self.tokenizer.decode([idx.item()]), prob.item())
+            for idx, prob in zip(top.indices, top.values)
+        ]
+
+    @property
+    def n_layers(self) -> int:
+        layers_path = self.SUPPORTED_ARCH[self.arch_key][0]
+        layers = self.model
+        for part in layers_path.split("."):
+            layers = getattr(layers, part)
+        return len(layers)
+
+    @property
+    def d_model(self) -> int:
+        return self.model.config.hidden_size
+
+"""
+Activation Patching: causal intervention to identify which components
+are responsible for a factual output.
+
+Algorithm
+---------
+1. Run the model on a "clean" prompt  → cache clean activations
+2. Run the model on a "corrupted" prompt → cache corrupted activations
+3. For each component (layer L, head H or MLP):
+   a. Start from the corrupted run
+   b. Patch in the clean activation at component (L, H)
+   c. Measure how much the target token's logit recovers
+4. Components with high recovery = causally important
+
+Reference: Meng et al., "Locating and Editing Factual Associations in GPT" (NeurIPS 2022)
+"""
+
+from __future__ import annotations
+from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+
+import torch
+import numpy as np
+from tqdm import tqdm
+
+from causaltrace.core.model_wrapper import ModelWrapper, ActivationCache
+
+
+@dataclass
+class PatchingResult:
+    """Holds the outcome of a full patching sweep."""
+    # Shape: (n_layers,) for MLP; (n_layers, n_heads) for attention
+    attn_recovery: np.ndarray
+    mlp_recovery: np.ndarray
+    residual_recovery: np.ndarray
+
+    clean_logit: float
+    corrupted_logit: float
+    target_token: str
+    prompt_clean: str
+    prompt_corrupted: str
+
+
+class ActivationPatcher:
+    """
+    Performs causal tracing via activation patching over all layers.
+
+    Parameters
+    ----------
+    model : ModelWrapper
+        Wrapped model with registered hooks.
+    """
+
+    def __init__(self, model: ModelWrapper):
+        self.model = model
+
+    def patch_sweep(
+        self,
+        prompt_clean: str,
+        prompt_corrupted: str,
+        target_token: str,
+        patch_types: List[str] = ("attn", "mlp", "residual"),
+        show_progress: bool = True,
+    ) -> PatchingResult:
+        """
+        Full patching sweep across all layers and heads.
+
+        Parameters
+        ----------
+        prompt_clean : str
+            The factually correct prompt (e.g., "The Eiffel Tower is in Paris").
+        prompt_corrupted : str
+            Noisy or counterfactual variant (e.g., "xjqz Eiffel Tower is in Paris").
+        target_token : str
+            The token whose logit we track (e.g., " Paris").
+        patch_types : list of str
+            Which components to patch: 'attn', 'mlp', 'residual'.
+
+        Returns
+        -------
+        PatchingResult
+        """
+        target_id = self.model.tokenizer.encode(target_token)[-1]
+
+        # Step 1: Clean run
+        with self.model.trace(prompt_clean):
+            logits_clean, cache_clean = self.model.run()
+        clean_logit = self._get_logit(logits_clean, target_id)
+
+        # Step 2: Corrupted run
+        with self.model.trace(prompt_corrupted):
+            logits_corrupt, cache_corrupt = self.model.run()
+        corrupt_logit = self._get_logit(logits_corrupt, target_id)
+
+        n_layers = self.model.n_layers
+
+        attn_recovery = np.zeros(n_layers)
+        mlp_recovery = np.zeros(n_layers)
+        residual_recovery = np.zeros(n_layers)
+
+        layers = range(n_layers)
+        if show_progress:
+            layers = tqdm(layers, desc="Patching layers")
+
+        for layer_idx in layers:
+            key = f"layer_{layer_idx}"
+
+            if "attn" in patch_types and key in cache_clean.attn_outputs:
+                logit = self._patch_and_run(
+                    prompt_corrupted,
+                    component_key=key,
+                    cache_source=cache_clean,
+                    cache_type="attn_outputs",
+                    target_id=target_id,
+                )
+                attn_recovery[layer_idx] = self._recovery_score(
+                    corrupt_logit, clean_logit, logit
+                )
+
+            if "mlp" in patch_types and key in cache_clean.mlp_outputs:
+                logit = self._patch_and_run(
+                    prompt_corrupted,
+                    component_key=key,
+                    cache_source=cache_clean,
+                    cache_type="mlp_outputs",
+                    target_id=target_id,
+                )
+                mlp_recovery[layer_idx] = self._recovery_score(
+                    corrupt_logit, clean_logit, logit
+                )
+
+            if "residual" in patch_types and key in cache_clean.residual_stream:
+                logit = self._patch_and_run(
+                    prompt_corrupted,
+                    component_key=key,
+                    cache_source=cache_clean,
+                    cache_type="residual_stream",
+                    target_id=target_id,
+                )
+                residual_recovery[layer_idx] = self._recovery_score(
+                    corrupt_logit, clean_logit, logit
+                )
+
+        return PatchingResult(
+            attn_recovery=attn_recovery,
+            mlp_recovery=mlp_recovery,
+            residual_recovery=residual_recovery,
+            clean_logit=clean_logit,
+            corrupted_logit=corrupt_logit,
+            target_token=target_token,
+            prompt_clean=prompt_clean,
+            prompt_corrupted=prompt_corrupted,
+        )
+
+    def _patch_and_run(
+        self,
+        prompt_corrupted: str,
+        component_key: str,
+        cache_source: ActivationCache,
+        cache_type: str,
+        target_id: int,
+    ) -> float:
+        """Patch a single component and return the target token logit."""
+        clean_act = getattr(cache_source, cache_type)[component_key]
+        hook_handles = []
+
+        def patch_hook(module, inp, out):
+            if isinstance(out, tuple):
+                patched = (clean_act.to(out[0].device),) + out[1:]
+                return patched
+            return clean_act.to(out.device)
+
+        # Attach a single-shot patch hook
+        layers_path = self.model.SUPPORTED_ARCH[self.model.arch_key][0]
+        layers = self.model.model
+        for part in layers_path.split("."):
+            layers = getattr(layers, part)
+
+        layer_idx = int(component_key.split("_")[1])
+        layer = layers[layer_idx]
+
+        if cache_type == "residual_stream":
+            h = layer.register_forward_hook(patch_hook)
+        elif cache_type == "attn_outputs":
+            attn_name = self.model.SUPPORTED_ARCH[self.model.arch_key][1]
+            h = getattr(layer, attn_name).register_forward_hook(patch_hook)
+        else:  # mlp_outputs
+            mlp_name = self.model.SUPPORTED_ARCH[self.model.arch_key][2]
+            h = getattr(layer, mlp_name).register_forward_hook(patch_hook)
+
+        hook_handles.append(h)
+
+        inputs = self.model.tokenizer(prompt_corrupted, return_tensors="pt").to(
+            self.model.device
+        )
+        with torch.no_grad():
+            outputs = self.model.model(**inputs)
+        logit = self._get_logit(outputs.logits, target_id)
+
+        for h in hook_handles:
+            h.remove()
+
+        return logit
+
+    @staticmethod
+    def _get_logit(logits: torch.Tensor, token_id: int) -> float:
+        return logits[0, -1, token_id].item()
+
+    @staticmethod
+    def _recovery_score(corrupt: float, clean: float, patched: float) -> float:
+        """
+        Normalized recovery score in [0, 1].
+        0 = no recovery (patch had no effect), 1 = full recovery (patch fully restored clean output).
+        """
+        denom = clean - corrupt
+        if abs(denom) < 1e-8:
+            return 0.0
+        return (patched - corrupt) / denom
